@@ -394,7 +394,7 @@ def _get_fsdp2_mesh(module: nn.Module):
         return fsdp_state._fsdp_param_group.post_forward_mesh_info.mesh
 
 
-def _get_enclosing_fsdp_module(
+def get_enclosing_fsdp_module(
     module: nn.Module,
     root_model: nn.Module,
     name_to_module_mapping: dict[str, nn.Module] | None = None,
@@ -444,8 +444,11 @@ def fsdp2_weight_access_and_writeback_context(
     assert not hasattr(module, "_hf_hook"), "We dont support FSDP2 with HF accelerate hooks"
     assert isinstance(module.weight, torch.distributed.tensor.DTensor)
 
-    fsdp_module = _get_enclosing_fsdp_module(
-        module, root_model, name_to_module_mapping, module_to_name_mapping
+    fsdp_module = get_enclosing_fsdp_module(
+        module,
+        root_model,
+        name_to_module_mapping=name_to_module_mapping,
+        module_to_name_mapping=module_to_name_mapping,
     )
     assert fsdp_module is not None, "Module is not wrapped by FSDP"
     fsdp_device_mesh = _get_fsdp2_mesh(fsdp_module)
@@ -491,7 +494,7 @@ def enable_weight_access_and_writeback(
     HF accelerate CPU off-loaded models.
     """
     if (
-        _get_enclosing_fsdp_module(
+        get_enclosing_fsdp_module(
             module, root_model, name_to_module_mapping, module_to_name_mapping
         )
         is not None
@@ -732,7 +735,9 @@ def fsdp2_aware_weight_update(
 
             root_modules = set()
             for module in modules_to_update:
-                root_module = _get_enclosing_fsdp_module(module, root_model, name_to_module_mapping)
+                root_module = get_enclosing_fsdp_module(
+                    module, root_model, name_to_module_mapping, module_to_name_mapping
+                )
                 root_modules.add(root_module)
 
             # Ensure all modules in root_modules are the same
@@ -746,7 +751,15 @@ def fsdp2_aware_weight_update(
 
             # Get FSDPParam list
             fsdp_param_group = fully_shard.state(root_module)._fsdp_param_group
-            fsdp_param_mapping = create_fsdp_param_mapping(fsdp_param_group.fsdp_params, root_model)
+            # fsdp_param_mapping = create_fsdp_param_mapping(fsdp_param_group.fsdp_params, root_model)
+
+            fsdp_param_mapping = {
+                module_to_name_mapping.get(param._module_info.module): param
+                for param in fsdp_param_group.fsdp_params
+            }
+            # assert fsdp_param_mapping == test_fsdp_param_mapping, (
+            #     f"fsdp_param_mapping: {fsdp_param_mapping} != test_fsdp_param_mapping: {test_fsdp_param_mapping}"
+            # )
 
             # Assert that all the modules in the module list are present in this fsdp_param_group
             if len(modules_to_update) > 1:

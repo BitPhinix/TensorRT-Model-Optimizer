@@ -16,15 +16,19 @@
 """Base Class for Real Quantized Tensor."""
 
 import enum
+import gc
+from collections import defaultdict
 
 import torch
 from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
 from torch.distributed.tensor import DTensor
+from tqdm import tqdm
 
 from modelopt.torch.quantization.utils import (
     create_module_to_name_mapping,
     create_name_to_module_mapping,
     fsdp2_aware_weight_update,
+    get_enclosing_fsdp_module,
     patch_fsdp_mp_dtypes,
 )
 
@@ -229,14 +233,31 @@ def pack_real_quantize_weight(module, force_quantize: bool = False):
     name_to_module_mapping = create_name_to_module_mapping(module)
     module_to_name_mapping = create_module_to_name_mapping(module)
 
+    to_compress = defaultdict(list)
+    for name, m in module.named_modules():
+        if name != "" and _should_compress(m):
+            fsdp_module = get_enclosing_fsdp_module(
+                m,
+                module,
+                name_to_module_mapping=name_to_module_mapping,
+                module_to_name_mapping=module_to_name_mapping,
+            )
+            to_compress[id(fsdp_module)].append(m)
+
     with (
         SequentialQuantizer.convert_to_single_quantizer(module),
         torch.no_grad(),
         patch_fsdp_mp_dtypes(),
     ):
-        for name, m in module.named_modules():
-            if name != "" and _should_compress(m):
-                with fsdp2_aware_weight_update(
-                    module, m, name_to_module_mapping, module_to_name_mapping
-                ):
+        for mm in tqdm(to_compress.values()):
+            with fsdp2_aware_weight_update(
+                module,
+                mm,
+                name_to_module_mapping=name_to_module_mapping,
+                module_to_name_mapping=module_to_name_mapping,
+            ):
+                for m in mm:
                     _compress_and_update_module_weight(m)
+
+            gc.collect()
+            torch.cuda.empty_cache()
