@@ -394,27 +394,31 @@ def _get_fsdp2_mesh(module: nn.Module):
         return fsdp_state._fsdp_param_group.post_forward_mesh_info.mesh
 
 
-def _get_module_name(module: nn.Module, root_model: nn.Module):
-    name_to_module = dict(root_model.named_modules())
-    target_module_name = next((name for name, m in name_to_module.items() if m is module), None)
-    return target_module_name
-
-
-def _get_enclosing_fsdp_module(module: nn.Module, root_model: nn.Module):
+def _get_enclosing_fsdp_module(
+    module: nn.Module,
+    root_model: nn.Module,
+    name_to_module_mapping: dict[str, nn.Module] | None = None,
+    module_to_name_mapping: dict[nn.Module, str] | None = None,
+):
     """Get the enclosing FSDP module for a given module."""
     if isinstance(module, FSDPModule):
         return module
 
-    name_to_module = dict(root_model.named_modules())
-    target_module_name = _get_module_name(module, root_model)
+    if name_to_module_mapping is None:
+        name_to_module_mapping = create_name_to_module_mapping(root_model)
+    if module_to_name_mapping is None:
+        module_to_name_mapping = create_module_to_name_mapping(root_model)
 
+    target_module_name = module_to_name_mapping.get(module)
     if target_module_name is None:
-        raise ValueError(f"Module {module} not found in the root model {root_model}.")
+        raise ValueError(
+            f"Module {module} not found in the name_to_module_mapping {name_to_module_mapping}."
+        )
 
     current_name = target_module_name
     while "." in current_name:
         parent_name = ".".join(current_name.split(".")[:-1])
-        parent_module = name_to_module.get(parent_name)
+        parent_module = name_to_module_mapping.get(parent_name)
         if parent_module and isinstance(parent_module, FSDPModule):
             return parent_module
         current_name = parent_name
@@ -424,7 +428,12 @@ def _get_enclosing_fsdp_module(module: nn.Module, root_model: nn.Module):
 
 
 @contextmanager
-def fsdp2_weight_access_and_writeback_context(module: nn.Module, root_model: nn.Module):
+def fsdp2_weight_access_and_writeback_context(
+    module: nn.Module,
+    root_model: nn.Module,
+    name_to_module_mapping: dict[str, nn.Module] | None = None,
+    module_to_name_mapping: dict[nn.Module, str] | None = None,
+):
     """Context manager for FSDP2 weight access and writeback.
 
     Note this context will gather the weight across FSDP/HSDP shards. If TP is implemented with DTensor,
@@ -434,7 +443,10 @@ def fsdp2_weight_access_and_writeback_context(module: nn.Module, root_model: nn.
 
     assert not hasattr(module, "_hf_hook"), "We dont support FSDP2 with HF accelerate hooks"
     assert isinstance(module.weight, torch.distributed.tensor.DTensor)
-    fsdp_module = _get_enclosing_fsdp_module(module, root_model)
+
+    fsdp_module = _get_enclosing_fsdp_module(
+        module, root_model, name_to_module_mapping, module_to_name_mapping
+    )
     assert fsdp_module is not None, "Module is not wrapped by FSDP"
     fsdp_device_mesh = _get_fsdp2_mesh(fsdp_module)
     fsdp_dim = fsdp_device_mesh.ndim
@@ -467,14 +479,26 @@ def fsdp2_weight_access_and_writeback_context(module: nn.Module, root_model: nn.
 
 
 @contextmanager
-def enable_weight_access_and_writeback(module, root_model):
+def enable_weight_access_and_writeback(
+    module,
+    root_model,
+    name_to_module_mapping: dict[str, nn.Module] | None = None,
+    module_to_name_mapping: dict[nn.Module, str] | None = None,
+):
     """Enable weight access and writeback for a module.
 
     Useful for modules with weight not intact such as Linear layer in FSDP wrapped model or
     HF accelerate CPU off-loaded models.
     """
-    if _get_enclosing_fsdp_module(module, root_model) is not None:
-        context = fsdp2_weight_access_and_writeback_context(module, root_model)
+    if (
+        _get_enclosing_fsdp_module(
+            module, root_model, name_to_module_mapping, module_to_name_mapping
+        )
+        is not None
+    ):
+        context = fsdp2_weight_access_and_writeback_context(
+            module, root_model, name_to_module_mapping, module_to_name_mapping
+        )
     elif is_quantized_parallel_linear(module) and hasattr(module, "_hf_tp_plan"):
         # HF transformers TP sharded linear layer
         context = module.enable_weight_access_and_writeback()
@@ -592,6 +616,16 @@ def create_fsdp_param_mapping(fsdp_param_list, model):
     }
 
 
+def create_module_to_name_mapping(model):
+    """Builds a mapping from module to its name."""
+    return {module: name for name, module in model.named_modules()}
+
+
+def create_name_to_module_mapping(model):
+    """Builds a mapping from module name to its module."""
+    return dict(model.named_modules())
+
+
 @contextmanager
 def no_requires_grad():
     """Context manager to temporarily set requires_grad to False.
@@ -661,7 +695,13 @@ def disable_calib(quantizer):
 
 
 @contextmanager
-def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
+def fsdp2_aware_weight_update(
+    root_model,
+    modules_to_update,
+    reshard=True,
+    name_to_module_mapping=None,
+    module_to_name_mapping=None,
+):
     """Context manager to update the FSDPParam list if an update is made to a submodule of an FSDPModule.
 
     This context manager is to be used when updating a weight of a sharded module to ensure the changes are properly
@@ -680,6 +720,11 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
         None
     """
     try:
+        if name_to_module_mapping is None:
+            name_to_module_mapping = create_name_to_module_mapping(root_model)
+        if module_to_name_mapping is None:
+            module_to_name_mapping = create_module_to_name_mapping(root_model)
+
         if isinstance(root_model, FSDPModule):
             # Get FSDP root module, if none is returned, then the update is not made to a submodule of an FSDPModule
             if not isinstance(modules_to_update, list):
@@ -687,7 +732,7 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
 
             root_modules = set()
             for module in modules_to_update:
-                root_module = _get_enclosing_fsdp_module(module, root_model)
+                root_module = _get_enclosing_fsdp_module(module, root_model, name_to_module_mapping)
                 root_modules.add(root_module)
 
             # Ensure all modules in root_modules are the same
@@ -706,7 +751,7 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
             # Assert that all the modules in the module list are present in this fsdp_param_group
             if len(modules_to_update) > 1:
                 for module in modules_to_update:
-                    name = _get_module_name(module, root_model)
+                    name = module_to_name_mapping.get(module)
                     assert name in fsdp_param_mapping, (
                         f"Module {module} not found in fsdp_param_mapping"
                     )
@@ -718,7 +763,7 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
         if isinstance(root_model, FSDPModule):
             # Update FSDPParam list
             for module in modules_to_update:
-                name = _get_module_name(module, root_model)
+                name = module_to_name_mapping.get(module)
                 if name not in fsdp_param_mapping:
                     continue
 

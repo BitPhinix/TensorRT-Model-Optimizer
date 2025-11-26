@@ -21,7 +21,12 @@ import torch
 from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
 from torch.distributed.tensor import DTensor
 
-from modelopt.torch.quantization.utils import fsdp2_aware_weight_update, patch_fsdp_mp_dtypes
+from modelopt.torch.quantization.utils import (
+    create_module_to_name_mapping,
+    create_name_to_module_mapping,
+    fsdp2_aware_weight_update,
+    patch_fsdp_mp_dtypes,
+)
 
 
 class QTensorType(enum.Enum):
@@ -202,7 +207,7 @@ def pack_real_quantize_weight(module, force_quantize: bool = False):
         if hasattr(module, "weight") and (module.weight is None or module.weight.is_meta):
             # We dont compress meta tensors or None
             return False
-        
+
         if (
             hasattr(module, "weight_quantizer")
             and module.weight_quantizer.is_enabled
@@ -210,7 +215,7 @@ def pack_real_quantize_weight(module, force_quantize: bool = False):
             and module.weight.element_size() > 1
         ):
             return True
-        
+
         return False
 
     def _compress_and_update_module_weight(module):
@@ -221,6 +226,9 @@ def pack_real_quantize_weight(module, force_quantize: bool = False):
         real_quant_tensor = module.weight_quantizer(module.weight)
         module.weight = QTensorWrapper(real_quant_tensor)
 
+    name_to_module_mapping = create_name_to_module_mapping(module)
+    module_to_name_mapping = create_module_to_name_mapping(module)
+
     with (
         SequentialQuantizer.convert_to_single_quantizer(module),
         torch.no_grad(),
@@ -228,5 +236,7 @@ def pack_real_quantize_weight(module, force_quantize: bool = False):
     ):
         for name, m in module.named_modules():
             if name != "" and _should_compress(m):
-                with fsdp2_aware_weight_update(module, m):
+                with fsdp2_aware_weight_update(
+                    module, m, name_to_module_mapping, module_to_name_mapping
+                ):
                     _compress_and_update_module_weight(m)
