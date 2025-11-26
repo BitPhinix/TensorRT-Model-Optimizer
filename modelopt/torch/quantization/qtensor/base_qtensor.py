@@ -198,25 +198,28 @@ def pack_real_quantize_weight(module, force_quantize: bool = False):
     # Import SequentialQuantizer here to avoid circular import
     from ..nn import SequentialQuantizer
 
-    def _compress_and_update_module_weight(module):
-        """Compresses and updates module weights if quantizer is enabled. Returns True when compression is applied."""
+    def _should_compress(module):
         if hasattr(module, "weight") and (module.weight is None or module.weight.is_meta):
             # We dont compress meta tensors or None
             return False
+        
         if (
             hasattr(module, "weight_quantizer")
             and module.weight_quantizer.is_enabled
             and not module.weight_quantizer._fake_quant
             and module.weight.element_size() > 1
         ):
-            if force_quantize:
-                module.weight_quantizer._dequantize = False
-
-            real_quant_tensor = module.weight_quantizer(module.weight)
-            module.weight = QTensorWrapper(real_quant_tensor)
             return True
-
+        
         return False
+
+    def _compress_and_update_module_weight(module):
+        """Compresses and updates module weights."""
+        if force_quantize:
+            module.weight_quantizer._dequantize = False
+
+        real_quant_tensor = module.weight_quantizer(module.weight)
+        module.weight = QTensorWrapper(real_quant_tensor)
 
     with (
         SequentialQuantizer.convert_to_single_quantizer(module),
@@ -224,6 +227,6 @@ def pack_real_quantize_weight(module, force_quantize: bool = False):
         patch_fsdp_mp_dtypes(),
     ):
         for name, m in module.named_modules():
-            if name != "":
+            if name != "" and _should_compress(m):
                 with fsdp2_aware_weight_update(module, m):
                     _compress_and_update_module_weight(m)
